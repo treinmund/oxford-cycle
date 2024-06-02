@@ -1,4 +1,4 @@
-# _Oxford Cycles_
+# _Oxford Cycle_
 
 [Overview sentence of the project.]
 
