@@ -1,0 +1,483 @@
+---
+title: "UniD"
+subtitle: "Exploratory Data Analysis"
+format: html
+editor: visual
+execute: 
+  warning: false
+---
+
+# Introduction
+
+This notebook includes exploratory data analysis conducted on the uniD data set. The objective of this analysis is to develop analysis methods that will be extended to the Oxford data set.
+
+Specifically, this analysis aims to explore:
+
+1.  Traffic flow according to space and time.
+2.  Safety issues based on distance between vehicle types and velocity of vehicles.
+
+```{r}
+#| output: false
+# Import libraries
+library(tidyverse)
+library(here)
+library(plotly)
+library(stats)
+
+#library(caret)
+#library(ggthemes)
+#library(cowplot)
+```
+
+# Data loader
+
+**The following code reads the required `csv` files and performs preliminary feature engineering.**
+
+```{r}
+#| output: false
+#| eval: false
+#| echo: false
+# Set file paths
+here::i_am("uniD-EDA/uniD-EDA.qmd")
+
+input_path <- paste0(here(), "/data/")
+
+tracks_files <- list.files(input_path, pattern = "*_tracks.csv", full.names = TRUE)
+tracks_meta_files <- list.files(input_path, pattern = "*_tracksMeta.csv", full.names = TRUE)
+recording_meta_files <- list.files(input_path, pattern = "*_recordingMeta.csv", full.names = TRUE)
+
+# Read csv files
+tracks_dfs <- map(tracks_files, read_csv, show_col_types = FALSE)
+tracks_meta_dfs <- map(tracks_meta_files, read_csv, show_col_types = FALSE)
+```
+
+# Data preparation
+
+```{r}
+# Define column subset for analysis
+eda_cols = c("recordingId",
+            "trackId",
+            "frame",
+            "trackLifetime",
+            "xCenter",
+            "yCenter",
+            "width",
+            "length",
+            "xVelocity",
+            "yVelocity",
+            "latVelocity",
+            "lonVelocity"
+)
+
+# Prepare the data by selecting a subset of rows and merging with class labels
+prepare_data <- function(tracks, meta_data) {
+  tracks |>
+  select(all_of(eda_cols)) |>
+    as_tibble() |>
+    left_join(select(meta_data, trackId, class), by = 'trackId')
+}
+
+map2(tracks_dfs, tracks_meta_dfs, prepare_data) -> tracks_dfs
+```
+
+
+It will also be helpful to have the magnitude of the velocity, as well as the orientation and direction of the object. We need to first define a rotating bounding box for each object to get the orientation.
+
+
+```{r}
+calculateRotatingBoundingBox <- function(x_center, y_center, width, length, angle = 45) {
+  # Convert the rotation angle to radians. Angle is 45 degrees from image.
+  angle_rad <- angle * (pi / 180)
+  
+  # Calculate half the width and half the length
+  half_width <- width / 2
+  half_length <- length / 2
+  
+  # Calculate the coordinates of the bounding box corners
+  x_cos <- half_length * cos(angle_rad)
+  x_sin <- half_width * sin(angle_rad)
+  y_cos <- half_length * sin(angle_rad)
+  y_sin <- half_width * cos(angle_rad)
+  
+  x_min <- x_center - x_cos - y_sin
+  x_max <- x_center + x_cos - y_sin
+  y_min <- y_center - x_sin + y_cos
+  y_max <- y_center + x_sin + y_cos
+  
+  # Return the bounding box coordinates as a list
+  return(list(x_min = x_min, x_max = x_max, y_min = y_min, y_max = y_max))
+}
+
+calculateOrientation <- function(x_min, x_max, y_min, y_max) {
+  # Calculate the center point of the bounding box
+  x_center <- (x_min + x_max) / 2
+  y_center <- (y_min + y_max) / 2
+  
+  # Calculate the orientation as the arctangent of the box's side
+  orientation_rad <- atan2(y_max - y_min, x_max - x_min)
+  
+  # Convert the orientation angle to degrees
+  orientation_deg <- orientation_rad * (180 / pi)
+  
+  # Return the orientation angle in degrees and the center point coordinates
+  return(list(orientation_deg = orientation_deg, x_center = x_center, y_center = y_center))
+}
+
+calculateDirection <- function(delta_x, delta_y) {
+  # Calculate the direction angle in radians
+  direction_rad <- atan2(delta_y, delta_x)
+  
+  # Convert the direction angle to degrees
+  direction_deg <- direction_rad * (180 / pi)
+  
+  # Return the direction angle in degrees
+  return(direction_deg)
+}
+
+# Calculate the change in x and y position across each frame
+calculatePositionChange <- function(df) {
+  df |>
+  group_by(trackId) |>
+  mutate(
+    delta_x = lag(xCenter) - xCenter,
+    delta_y = lag(yCenter) - yCenter,
+    
+    # Replace NA from first observation with 0
+    delta_x = coalesce(delta_x, 0),
+    delta_y = coalesce(delta_y, 0)
+  )
+}
+
+
+# Calculate position change for each track
+tracks_dfs <- lapply(tracks_dfs, calculatePositionChange)
+
+
+# Calculate the orientation, direction, and area of each object
+tracks_eda <- lapply(tracks_dfs, function(df) {
+  df |>
+  mutate(
+    mVelocity = sqrt(xVelocity^2 + yVelocity^2),
+    orientation = calculateOrientation(calculateRotatingBoundingBox(xCenter, yCenter, width, length)$x_min,
+                                       calculateRotatingBoundingBox(xCenter, yCenter, width, length)$x_max,
+                                       calculateRotatingBoundingBox(xCenter, yCenter, width, length)$y_min,
+                                       calculateRotatingBoundingBox(xCenter, yCenter, width, length)$y_max
+                                       )$orientation_deg,
+    direction = calculateDirection(delta_x, delta_y),
+    area = width * length
+  ) |>
+  # Adjust the direction angle to be between 0 and 360 degrees
+  mutate(
+    direction = case_when(direction < 0 ~ direction + 360,
+                          direction >= 0 ~ direction)
+  )
+})
+
+# Create binary variable for Vulnerable Road Users (VRU)
+tracks_eda <- lapply(tracks_eda, function(df) {
+  df |>
+    mutate(
+    VRU = case_when(class == "pedestrian" ~ 1,
+                    class == "bicycle" ~ 1,
+                    class == "animal" ~ 1,
+                    class == "motorcycle" ~ 1,
+                    class == "car" ~ 0,
+                    class == "bus" ~ 0,
+                    class == "truck" ~ 0,
+                    class == "trailer" ~ 0,
+                    class == "van" ~ 0
+    )
+    )
+}
+)
+```
+
+# Data exploration
+
+What is the distribution of class labels?
+
+```{r}
+
+lapply(tracks_eda, function(df) {
+  df |>
+    select(class, trackId) |>
+    distinct() |>
+    count(class) |>
+    ggplot(aes(x = class, y = n)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    labs(x = "Class", y = "Count", title = "Distribution of class labels") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+  
+  )
+```
+
+What is the distribution of velocities?
+
+```{r}
+lapply(tracks_eda, function(df) {
+  df |>
+    ggplot(aes(x = mVelocity)) +
+    geom_histogram(fill = "steelblue", bins = 50) +
+    scale_y_log10() + # Scale the y-axis to log10
+    labs(x = "Velocity", y = "log(Count)", title = "Distribution of velocities") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+)
+```
+
+# Traffic flow analysis
+
+How does velocity vary with position?
+
+```{r}
+vru.labs <- c("Non-VRU", "VRU")
+names(vru.labs) <- c(0, 1)
+
+lapply(tracks_eda, function(df) {
+  df |>
+    mutate(
+      VRU = as.factor(VRU)
+    ) |>
+    filter(mVelocity > 0) |> # Filter non-moving frames
+    ggplot(aes(xCenter, yCenter, color = mVelocity)) +
+    geom_point() +
+    scale_colour_continuous(type = "viridis") +
+    facet_wrap(
+      vars(VRU),
+      labeller = labeller(VRU = vru.labs)
+      )
+}
+)
+```
+
+How many unique vehicles travel down the segment during different intervals?
+
+```{r}
+# Create intervals based on frames
+interval_length <- 2000
+
+# There is variation among the number of frames per recording.
+# This creates a set number of frames per interval.
+tracks_eda_int <- lapply(tracks_eda, function(df) {
+  df |>
+    mutate(
+      interval = cut_interval(frame, length = interval_length, boundary = 0)
+    )
+})
+
+# Count the number of classes per interval
+interval_dfs <- lapply(tracks_eda_int, function(df) {
+  df |>
+    ungroup() |>
+    select(trackId, interval, class) |>
+    distinct() |>
+    group_by(interval, class) |>
+    summarise(
+      count = n()
+    )
+})
+
+
+interval_dfs |>
+  lapply(function(df) {
+    df |>
+      ggplot() +
+      geom_col(aes(interval, count), position = "dodge") +
+      scale_x_discrete(labels = c(1:interval_length)) +
+      facet_wrap(vars(class)) +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  })
+```
+
+
+# Safety analysis
+
+Questions to answer:
+
+-   How can I use the radius of an object (using the shortest width/length) to calculate distances between tracks
+-   How can I get a count of vehicles across specific points on the road?
+-   How can I include velocity in the near miss analysis to classify them into higher/lower risk
+
+What is the distance between different vehicles?
+
+
+What is the distance between VRUs and non-VRUs?
+
+```{r}
+# A function to calculate distinace between VRUs and non-VRUs
+calculateDistance <- function(df) {
+# Argument: dataframe or list of dataframes
+# Returns: dataframe or list of dataframes with distance between VRUs and non-VRUs
+# Create separate vectors for VRU and non-VRUs
+  vru <- df |>
+    filter(VRU ==1) |>
+    select(trackId, xCenter, yCenter, mVelocity, VRU) |>
+    rename(
+      vru_Id = trackId,
+      vru_xCenter = xCenter,
+      vru_yCenter = yCenter,
+      vru_mVelocity = mVelocity,
+      vru = VRU
+    )
+  
+  non_vru <- df |>
+    filter(VRU == 0) |>
+    select(trackId, xCenter, yCenter, mVelocity, VRU) |>
+    rename(
+      non_vru_Id = trackId,
+      non_vru_xCenter = xCenter,
+      non_vru_yCenter = yCenter,
+      non_vru_mVelocity = mVelocity,
+      non_vru = VRU
+    )
+  
+  # Find all VRU and non-VRU combinations
+  combinations <- crossing(vru, non_vru)
+  
+  # Calculate distinace 
+  dist_df <- combinations |>
+    mutate(
+      distance = sqrt((vru_xCenter - non_vru_xCenter)^2 + (vru_yCenter - non_vru_yCenter)^2)
+    )
+  
+  return(dist_df)
+}
+
+# Create distance dataframe for each recording. Trying to create a function that does it all at one time keeps crashing my laptop
+recording0 <- tracks_eda[[1]] |> 
+  ungroup() |>
+  nest(.by = frame) |>
+  mutate(distance = lapply(data, calculateDistance))
+```
+
+Data visualisation of distances
+
+```{r}
+# Plot the distribution of distances between VRUs and non-VRUs
+recording0 |>
+  unnest(distance) |>
+  select(-data) |>
+  ggplot(aes(x = distance)) +
+  geom_histogram(fill = "steelblue", bins = 50) +
+  theme_minimal() +
+  labs(x = "Distance", y = "Count", title = "Distribution of distances between VRUs and non-VRUs")
+
+# A function to create a plot of distances between VRUs and non-VRUs
+createDistancePlot <- function(df) {
+  # Argument: Dataframe
+  # Returns: ggplot object
+  df |>
+  ggplot(aes(x = vru_xCenter, y = vru_yCenter)) +
+  geom_point(shape = 15, size = 2) + # Plot VRUs
+  geom_point(aes(x = non_vru_xCenter, y = non_vru_yCenter), shape = 2, size = 2) + # Plot non-VRUs
+  geom_segment(aes(x = vru_xCenter, y = vru_yCenter, xend = non_vru_xCenter, yend = non_vru_yCenter, color = distance), linewidth = 0.5, alpha = 0.5) + # Plot line between VRUs and non-VRUs
+  scale_color_viridis_c(name = "Distance", option = "D") +  # Add color scale
+  labs(x = "X Coordinate", y = "Y Coordinate", title = "Distance between VRUs and non-VRUs", color = "Distance", shape = "VRU")
+}
+
+# Create plots for each frame
+recording0_plots <- recording0 |>
+  mutate(plot = lapply(distance, createDistancePlot))
+
+recording0_plots$plot[[1]]
+recording0_plots$plot[[2]]
+recording0_plots$plot[[3]]
+recording0_plots$plot[[4]]
+recording0_plots$plot[[5]]
+recording0_plots$plot[[6]]
+recording0_plots$plot[[7]]
+recording0_plots$plot[[8]]
+
+
+ggplotly(p)
+```
+
+
+
+
+# Descriptive statistics
+
+**The following code performs preliminary descriptive statistical analysis.**
+
+How many of each class are in the recording?
+
+```{r}
+tracks_meta %>%
+  count(class)
+
+ggplot(tracks_meta, aes(x=class)) + 
+  geom_bar() +
+  geom_text(stat='count', aes(label=after_stat(count)), vjust=-0.5)
+```
+
+What is the median, minimum, and maximum velocities of each class?
+
+```{r}
+# First, calculate the med, min, and max velocity for each track
+velocity_stats <- tracks_with_class %>%
+  filter(mVelocity > 0) %>% # Ignore frames in which the track is not moving
+  group_by(trackId, class) %>%
+  summarise(
+    num_frames = n(), # The number of frames in which the track is present in the recording
+    velocity_max = max(mVelocity, na.rm = TRUE),
+    velocity_min = min(mVelocity, na.rm = TRUE),
+    velocity_median = median(mVelocity, na.rm = TRUE)
+  )
+```
+
+
+
+```{r}
+# Plot the max velocity by class
+max_box_plot <- velocity_stats %>%
+  ggplot(aes(class, velocity_max)) +
+  geom_boxplot() +
+  labs(title = "Max velocity (m/s)", y = "Max") +
+  ylim(0, 12.5) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# Plot the median velocity by class
+med_box_plot <- velocity_stats %>%
+  ggplot(aes(class, velocity_median)) +
+  geom_boxplot() +
+  labs(title = "Median velocity (m/s)", y = "Median") +
+  ylim(0, 12.5) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+plot_grid(max_box_plot, med_box_plot)
+```
+
+
+
+In which directions do the vehicles travel across the road segment?
+
+```{r}
+tracks_df$direction_int <- cut_interval(tracks_df$direction, n=10)
+
+direction_analysis <- tracks_df %>%
+  ggplot(aes(xCenter, yCenter, color=direction_int)) +
+  geom_point() +
+  scale_color_brewer(palette = "Paired", name = "Direction (in deg)") +
+  facet_wrap(vars(class))
+
+#ggsave(filename = "direction_analysis.png", plot = direction_analysis, device = "png", path = figure_path)
+```
+
+
+
+Where on the road do different objects move?
+
+```{r}
+# Select class to focus on in analysis
+tracks_with_class %>%
+  filter(mVelocity > 0 & class != "pedestrian") %>% # Exclude non-moving objects and pedestrians
+  ggplot(aes(xCenter, yCenter, colour=class)) +
+  geom_point(alpha = 0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+```
+
+
+
