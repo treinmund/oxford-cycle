@@ -23,10 +23,6 @@ library(tidyverse)
 library(here)
 library(plotly)
 library(stats)
-
-#library(caret)
-#library(ggthemes)
-#library(cowplot)
 ```
 
 # Data loader
@@ -80,9 +76,7 @@ prepare_data <- function(tracks, meta_data) {
 map2(tracks_dfs, tracks_meta_dfs, prepare_data) -> tracks_dfs
 ```
 
-
 It will also be helpful to have the magnitude of the velocity, as well as the orientation and direction of the object. We need to first define a rotating bounding box for each object to get the orientation.
-
 
 ```{r}
 calculateRotatingBoundingBox <- function(x_center, y_center, width, length, angle = 45) {
@@ -292,7 +286,6 @@ interval_dfs |>
   })
 ```
 
-
 # Safety analysis
 
 Questions to answer:
@@ -300,9 +293,6 @@ Questions to answer:
 -   How can I use the radius of an object (using the shortest width/length) to calculate distances between tracks
 -   How can I get a count of vehicles across specific points on the road?
 -   How can I include velocity in the near miss analysis to classify them into higher/lower risk
-
-What is the distance between different vehicles?
-
 
 What is the distance between VRUs and non-VRUs?
 
@@ -340,8 +330,12 @@ calculateDistance <- function(df) {
   # Calculate distinace 
   dist_df <- combinations |>
     mutate(
-      distance = sqrt((vru_xCenter - non_vru_xCenter)^2 + (vru_yCenter - non_vru_yCenter)^2)
-    )
+      distance = sqrt((vru_xCenter - non_vru_xCenter)^2 + (vru_yCenter - non_vru_yCenter)^2),
+      near_miss = case_when(
+        distance < 5 ~ 1,
+        distance >= 5 ~ 0
+      )
+    ) # Create a near miss column
   
   return(dist_df)
 }
@@ -390,94 +384,14 @@ recording0_plots$plot[[5]]
 recording0_plots$plot[[6]]
 recording0_plots$plot[[7]]
 recording0_plots$plot[[8]]
-
-
-ggplotly(p)
 ```
 
 
 
 
-# Descriptive statistics
+# Next steps
 
-**The following code performs preliminary descriptive statistical analysis.**
-
-How many of each class are in the recording?
-
-```{r}
-tracks_meta %>%
-  count(class)
-
-ggplot(tracks_meta, aes(x=class)) + 
-  geom_bar() +
-  geom_text(stat='count', aes(label=after_stat(count)), vjust=-0.5)
-```
-
-What is the median, minimum, and maximum velocities of each class?
-
-```{r}
-# First, calculate the med, min, and max velocity for each track
-velocity_stats <- tracks_with_class %>%
-  filter(mVelocity > 0) %>% # Ignore frames in which the track is not moving
-  group_by(trackId, class) %>%
-  summarise(
-    num_frames = n(), # The number of frames in which the track is present in the recording
-    velocity_max = max(mVelocity, na.rm = TRUE),
-    velocity_min = min(mVelocity, na.rm = TRUE),
-    velocity_median = median(mVelocity, na.rm = TRUE)
-  )
-```
-
-
-
-```{r}
-# Plot the max velocity by class
-max_box_plot <- velocity_stats %>%
-  ggplot(aes(class, velocity_max)) +
-  geom_boxplot() +
-  labs(title = "Max velocity (m/s)", y = "Max") +
-  ylim(0, 12.5) +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
-
-# Plot the median velocity by class
-med_box_plot <- velocity_stats %>%
-  ggplot(aes(class, velocity_median)) +
-  geom_boxplot() +
-  labs(title = "Median velocity (m/s)", y = "Median") +
-  ylim(0, 12.5) +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
-
-plot_grid(max_box_plot, med_box_plot)
-```
-
-
-
-In which directions do the vehicles travel across the road segment?
-
-```{r}
-tracks_df$direction_int <- cut_interval(tracks_df$direction, n=10)
-
-direction_analysis <- tracks_df %>%
-  ggplot(aes(xCenter, yCenter, color=direction_int)) +
-  geom_point() +
-  scale_color_brewer(palette = "Paired", name = "Direction (in deg)") +
-  facet_wrap(vars(class))
-
-#ggsave(filename = "direction_analysis.png", plot = direction_analysis, device = "png", path = figure_path)
-```
-
-
-
-Where on the road do different objects move?
-
-```{r}
-# Select class to focus on in analysis
-tracks_with_class %>%
-  filter(mVelocity > 0 & class != "pedestrian") %>% # Exclude non-moving objects and pedestrians
-  ggplot(aes(xCenter, yCenter, colour=class)) +
-  geom_point(alpha = 0.01) +
-  guides(colour = guide_legend(override.aes = list(alpha = 1)))
-```
-
+1) Define some measure of near miss. This could be a distance threshold between VRUs and non-VRUs.
+2) Identify positions on the road where near misses occur.
 
 
