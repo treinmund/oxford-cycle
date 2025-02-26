@@ -1,0 +1,383 @@
+---
+title: "Create Traffic Plots"
+format: html
+---
+
+# Set-up
+
+## Load Packages
+
+```{r}
+# Load required packages. If a package is missing, install it first.
+packages <- c("tidyverse", "ggplot2", "ggmap", "osmdata", "patchwork")
+
+# Install missing packages
+missing_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(missing_packages)) install.packages(missing_packages)
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+```
+
+## Set File Paths
+
+```{r}
+# Define input, output, and figure directories for reproducibility
+# Ensure these directories exist before running the script
+
+in_path <- "../input/"     # Path to input data files
+out_path <- "../results/"  # Path to save results
+fig_path <- "../figures/"  # Path to save figures
+```
+
+## Load Data
+
+```{r}
+plot_df <- read_rds(paste0(out_path, "processed/", "geocoded_traffic.rds"))
+```
+
+
+## Data Preparation
+
+```{r}
+# Exclude weekends
+plot_df <- plot_df |>
+  filter(day != "Sat" & day != "Sun")
+
+# Recode route names to align with paper
+## North -> North
+## South -> Central
+## East -> South
+
+# Create dataframe subsets
+north_df <- plot_df |>
+  filter(route == "North")
+
+central_df <- plot_df |>
+  filter(route == "South") |>
+  mutate(route = case_match(route,
+             "South" ~ "Central")
+  )
+
+south_df <- plot_df |>
+  filter(route == "East") |>
+  mutate(route = case_match(route,
+             "East" ~ "South")
+  )
+
+plot_df <- bind_rows(north_df, central_df, south_df)
+```
+
+
+# Exploratory Data Analysis
+
+## Traffic Duration Distribution
+
+```{r}
+# Plot the distribution of traffic duration
+plot_df |>
+  ggplot(aes(x = traffic_duration_min)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "Traffic Duration Distribution",
+       x = "Traffic Duration (minutes)",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+## Traffic Duration by Day of Week
+
+```{r}
+# Plot the traffic duration by day of week
+plot_df |>
+  ggplot(aes(x = wday(date, label = TRUE), y = traffic_duration_min)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  labs(title = "Traffic Duration by Day of Week",
+       x = "Day of Week",
+       y = "Traffic Duration (minutes)") +
+  theme_minimal()
+```
+
+## Travel Time Index Distribution
+
+```{r}
+# Plot the distribution of travel time index
+plot_df |>
+  ggplot(aes(x = travel_time_index)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(title = "Travel Time Index Distribution",
+       x = "Travel Time Index",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+
+```{r}
+# Plot travel time index by route
+plot_df |>
+  ggplot(aes(x = route, y = travel_time_index)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  labs(title = "Travel Time Index by Route",
+       x = "Route",
+       y = "Travel Time Index") +
+  theme_minimal()
+```
+
+```{r}
+# Plot travel time index by day of week and route
+plot_df |>
+  ggplot(aes(x = day, y = travel_time_index)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  facet_grid(rows = vars(route)) +
+  labs(title = "Travel Time Index by Day of Week and Time of Day",
+       x = "Day of Week",
+       y = "Travel Time Index") +
+  theme_minimal()
+```
+
+## Calculate TTI for each segment
+
+```{r}
+## North Route
+north_tti <- north_df |>
+  filter(!is.na(travel_time_index)) |>
+  group_by(id, start_geocode, end_geocode, geometry) |>
+  summarise(
+   tti_median = median(travel_time_index, na.rm = TRUE),
+   tti_max = max(travel_time_index, na.rm = TRUE),
+   tti_min = min(travel_time_index, na.rm = TRUE)
+   ) |>
+  filter(id != 26) # This segment was removed from the path
+
+#### Make adjustments to the geometry of the segment with id 16
+segment_index <- north_tti[north_tti$id == 16, ]
+coords <- st_coordinates(segment_index)
+
+coords[1, "X"] <- coords[1, "X"] - 0.001
+coords[2, "X"] <- coords[1, "X"] + 0.001
+
+new_geom <- st_linestring(coords[, c("X", "Y")])
+
+north_tti[north_tti$id == 16, ]$geometry <- st_sfc(new_geom, crs = st_crs(north_tti))
+
+## South Route
+south_tti <- south_df |>
+  filter(!is.na(travel_time_index)) |>
+  group_by(id, start_geocode, end_geocode, geometry) |>
+  summarise(
+   tti_median = median(travel_time_index, na.rm = TRUE),
+   tti_max = max(travel_time_index, na.rm = TRUE),
+   tti_min = min(travel_time_index, na.rm = TRUE)
+   )
+
+## Central Route
+central_tti <- central_df |>
+  filter(!is.na(travel_time_index) & id != 9) |>
+  group_by(id, start_geocode, end_geocode, geometry) |>
+  summarise(
+   tti_median = median(travel_time_index, na.rm = TRUE),
+   tti_max = max(travel_time_index, na.rm = TRUE),
+   tti_min = min(travel_time_index, na.rm = TRUE)
+   )
+
+```
+
+# Traffic Plots
+
+## Get OpenStreetMap Basemap
+
+```{r}
+get_osm_basemap <- function(df) {
+
+  # Extract bounding box
+  bbox <- st_bbox(df)
+  
+  # Set up OSM features query - only select features we want to display
+  # Note: No "name" tag is queried, so road names won't be included
+  
+  # Get road network (without names)
+  roads <- bbox %>%
+    opq() %>%
+    add_osm_feature(key = "highway") %>%
+    osmdata_sf()
+  
+  # Get building footprints
+  buildings <- bbox %>%
+    opq() %>%
+    add_osm_feature(key = "building") %>%
+    osmdata_sf()
+  
+  # Create base ggplot map
+  basemap <- ggplot() +
+    # Roads (by type)
+    geom_sf(data = roads$osm_lines[roads$osm_lines$highway %in% c("motorway", "trunk", "primary"), ], 
+            color = "gray40", size = 0.8) +
+    geom_sf(data = roads$osm_lines[roads$osm_lines$highway %in% c("secondary", "tertiary"), ], 
+            color = "gray50", size = 0.5) +
+    geom_sf(data = roads$osm_lines[roads$osm_lines$highway %in% c("residential", "service", "unclassified"), ], 
+            color = "gray70", size = 0.2) +
+    # Buildings (gray)
+    geom_sf(data = buildings$osm_polygons, fill = "gray85", color = NA) +
+    # Styling
+    coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]),
+             ylim = c(bbox["ymin"], bbox["ymax"])) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(0, 0, 0, 0)
+    )
+  
+  return(basemap)
+}
+```
+
+
+```{r}
+# Get basemap for each route
+north_basemap <- get_osm_basemap(north_df)
+central_basemap <- get_osm_basemap(central_df)
+south_basemap <- get_osm_basemap(south_df)
+```
+
+
+## Plot Traffic Map
+
+```{r}
+# Function for traffic maps
+create_traffic_map <- function(df, basemap, measure, linewidth = 2, name = "TTI") {
+  traffic_map <- basemap +
+    geom_sf(data = df,
+            aes(color = !!sym(measure)),
+            inherit.aes = FALSE,
+            linewidth = 2) +
+    scale_color_viridis_c(option = "plasma",
+                          name = name,
+                          limits = c(global_min, global_max)) +
+    theme_void()
+  
+  return(traffic_map)
+}
+```
+
+
+
+```{r}
+# Find global min and max for color scale
+global_min <- min(north_tti$tti_median,
+                  central_tti$tti_median,
+                  south_tti$tti_median)
+
+global_max <- max(north_tti$tti_median,
+                  central_tti$tti_median,
+                  south_tti$tti_median)
+```
+
+
+```{r}
+## North Plot
+north_plot_median <- create_traffic_map(north_tti, north_basemap, "tti_median", name = "Travel Time Index")
+
+## Central Plot
+central_plot_median <- create_traffic_map(central_tti, central_basemap, "tti_median", name = "TTI")
+
+## South Plot
+south_plot_median <- create_traffic_map(south_tti, south_basemap, "tti_median", name = "TTI")
+
+ggsave(paste0(fig_path, "north_map_median.png"), plot = north_plot_median, width = 10, height = 8, units = "in")
+ggsave(paste0(fig_path, "central_map_median.png"), plot = central_plot_median, width = 10, height = 8, units = "in")
+ggsave(paste0(fig_path, "south_map_median.png"), plot = south_plot_median, width = 10, height = 8, units = "in")
+```
+
+
+
+## Plot Traffic Raster
+
+```{r}
+# Calculate median TTI for each road at each time
+tti_time <- traffic_df |>
+  group_by(route, road, pedestrian, time) |>
+  summarise(
+    median_travel_time_index = round(median(travel_time_index, na.rm = TRUE), 2)
+  )
+
+# North route
+north_raster <- tti_time |>
+  filter(route == "North" & pedestrian != 1 & !is.na(median_travel_time_index)) |>
+  mutate(road = as.factor(road)) |>
+  ggplot(aes(x = road, y = time)) +
+  geom_raster(aes(fill = median_travel_time_index)) +
+  labs(title = "Traffic Time Index (TTI) on Non-Pedestrian Routes",
+       subtitle = "North Loop",
+       x = "Road",
+       y = "Time of Day",
+       fill = "TTI") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(face = "italic", size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+    ) +
+  scale_fill_distiller(palette = "Spectral", na.value = "grey90", limits = c(0.8, 2.1))
+
+ggsave(paste0(fig_path, "north_raster.png"), plot = north_raster, width = 10, height = 8, units = "in")
+
+# South route
+south_raster <- tti_time |>
+  filter(route == "South" & pedestrian != 1 & !is.na(median_travel_time_index)) |>
+  mutate(road = as.factor(road)) |>
+  ggplot(aes(x = road, y = time)) +
+  geom_raster(aes(fill = median_travel_time_index)) +
+  labs(title = "Traffic Time Index (TTI) on Non-Pedestrian Routes",
+       subtitle = "Central Loop",
+       x = "Road",
+       y = "Time of Day",
+       fill = "TTI") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(face = "italic", size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+    ) +
+  scale_fill_distiller(palette = "Spectral", na.value = "grey90", limits = c(0.8, 2.1))
+
+ggsave(paste0(fig_path, "central_raster.png"), plot = south_raster, width = 10, height = 8, units = "in")
+
+# East route
+east_raster <- tti_time |>
+  filter(route == "East" & pedestrian != 1 & !is.na(median_travel_time_index)) |>
+  mutate(road = as.factor(road)) |>
+  ggplot(aes(x = road, y = time)) +
+  geom_raster(aes(fill = median_travel_time_index)) +
+  labs(title = "Traffic Time Index (TTI) on Non-Pedestrian Routes",
+       subtitle = "South Loop",
+       x = "Road",
+       y = "Time of Day",
+       fill = "TTI") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(face = "italic", size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+    ) +
+  scale_fill_distiller(palette = "Spectral", na.value = "grey90", limits = c(0.8, 2.1))
+
+ggsave(paste0(fig_path, "south_raster.png"), plot = east_raster, width = 10, height = 8, units = "in")
+```
